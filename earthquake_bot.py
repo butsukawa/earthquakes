@@ -1,7 +1,7 @@
 import os
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # Discord Webhook URL (GitHub ActionsのSecretsから読み込む)
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
@@ -10,17 +10,14 @@ STATUS_FILE = "last_earthquake.txt"
 # 気象庁の地震情報JSON (最新の地震リスト)
 JMA_URL = "https://www.jma.go.jp/bosai/quake/data/list.json"
 
-def get_latest_earthquake():
+def get_earthquake_list():
     try:
         response = requests.get(JMA_URL)
         response.raise_for_status()
-        data = response.json()
-        if data:
-            # 配列の先頭が最新の地震情報
-            return data[0]
+        return response.json()
     except Exception as e:
         print(f"データの取得に失敗しました: {e}")
-    return None
+    return []
 
 def get_embed_color(max_int):
     """
@@ -37,7 +34,6 @@ def get_embed_color(max_int):
         "6+": 15158332, # 赤色 (#E74C3C)
         "7": 10181046,  # 紫色 (#9B59B6)
     }
-    # 万が一想定外の表記（海外の地震など）だった場合はグレーにする
     return color_map.get(max_int, 9807270)
 
 def main():
@@ -45,78 +41,107 @@ def main():
         print("エラー: DISCORD_WEBHOOK_URL が設定されていません。")
         return
 
-    quake = get_latest_earthquake()
-    if not quake:
+    quakes = get_earthquake_list()
+    if not quakes:
+        print("地震データが空、または取得できませんでした。")
         return
 
-    # 一意のID（発表時刻やコードなどをキーにする）
-    quake_id = quake.get("eid", quake.get("at", ""))
-    
-    # 過去の最新IDを読み込み
+    # 過去の最新ID（前回通知済みの一番新しい地震）を読み込み
     last_id = ""
     if os.path.exists(STATUS_FILE):
         with open(STATUS_FILE, "r") as f:
             last_id = f.read().strip()
 
-    # 新しい地震がない場合は終了
-    if quake_id == last_id:
-        print("新しい地震情報はありません。")
+    # 現在時刻から24時間前の基準時刻を計算 (JSTベース)
+    # 気象庁の at は ISO8601形式 (例: 2026-06-28T09:12:00+09:00)
+    now_jst = datetime.now(timezone(timedelta(hours=9)))
+    one_day_ago = now_jst - timedelta(days=1)
+
+    # 通知対象の地震をフィルタリングする
+    targets = []
+    new_latest_id = None
+
+    for i, quake in enumerate(quakes):
+        quake_id = quake.get("eid", quake.get("at", ""))
+        
+        # 配列の先頭（インデックス0）が気象庁データの一番最新のID
+        if i == 0:
+            new_latest_id = quake_id
+
+        # 前回通知したIDに到達したら、それより古い（過去の）データは処理しない
+        if last_id and quake_id == last_id:
+            break
+
+        # 震度情報がないデータ（「顕著な地震要素更新」など）はスキップ
+        max_int = quake.get("maxi", "").strip()
+        if max_int == "" or max_int == "-":
+            continue
+
+        # 時刻のチェック（過去24時間以内か）
+        at_str = quake.get("at", "")
+        try:
+            # ISO形式からdatetimeオブジェクトに変換
+            dt = datetime.fromisoformat(at_str)
+            if dt < one_day_ago:
+                # 24時間より古いデータに達したらループ終了（JMAデータは新しい順に並んでいるため）
+                break
+        except Exception as e:
+            print(f"時刻パースエラー: {e}")
+            continue
+
+        # 条件をクリアした地震を通知候補に追加
+        targets.append((quake_id, quake, dt, max_int))
+
+    if not targets:
+        print("通知対象の新しい地震（過去24時間以内）はありません。")
+        # ログファイルが空だった場合などのために最新IDだけ保存して終了
+        if new_latest_id and new_latest_id != last_id:
+            with open(STATUS_FILE, "w") as f:
+                f.write(new_latest_id)
         return
 
-    # 1. 震度情報がないデータ（「顕著な地震の震源要素更新のお知らせ」など）の除外処理
-    max_int = quake.get("maxi", "").strip()
-    if max_int == "" or max_int == "-":
-        print(f"震度情報が含まれないため通知をスキップします。 (タイトル: {quake.get('ttl')})")
-        # 次回重複して読み込まないように、通知はしなくてもIDだけは更新しておく
-        with open(STATUS_FILE, "w") as f:
-            f.write(quake_id)
-        return
+    # 気象庁データは「新しい順」に入っているので、過去を遡る時は「古い順」に並び替えて通知する
+    targets.reverse()
 
-    # 地震情報のパース
-    at_str = quake.get("at", "不明")
-    try:
-        dt = datetime.fromisoformat(at_str)
+    print(f"{len(targets)} 件の地震情報をDiscordに送信します。")
+
+    for quake_id, quake, dt, max_int in targets:
         time_str = dt.strftime("%Y/%m/%d %H:%M")
-    except:
-        time_str = at_str
+        place = quake.get("anm", "調査中")
+        mag = quake.get("mag", "不明")
+        
+        int_display_map = {"5-": "5弱", "5+": "5強", "6-": "6弱", "6+": "6強"}
+        max_int_display = int_display_map.get(max_int, max_int)
+        embed_color = get_embed_color(max_int)
 
-    place = quake.get("anm", "調査中") # 震源地
-    mag = quake.get("mag", "不明")    # マグニチュード
-    
-    # 震度表示の日本語表記調整 (5- や 5+ を 5弱 や 5強 に見やすく変換)
-    int_display_map = {"5-": "5弱", "5+": "5強", "6-": "6弱", "6+": "6強"}
-    max_int_display = int_display_map.get(max_int, max_int)
+        payload = {
+            "embeds": [
+                {
+                    "title": f"🚨 地震情報（{quake.get('ttl', '震源・震度情報')}）",
+                    "color": embed_color,
+                    "fields": [
+                        {"name": "発生時刻", "value": time_str, "inline": True},
+                        {"name": "震源地", "value": place, "inline": True},
+                        {"name": "最大震度", "value": f"**震度 {max_int_display}**", "inline": False},
+                        {"name": "規模 (M)", "value": f"M{mag}", "inline": True},
+                    ],
+                    "footer": {"text": "情報元: 気象庁ホームページ"},
+                    "url": "https://www.data.jma.go.jp/multi/quake/index.html?lang=jp"
+                }
+            ]
+        }
 
-    # 震度に基づいたEmbedカラーを取得
-    embed_color = get_embed_color(max_int)
+        # Discordに送信
+        res = requests.post(WEBHOOK_URL, json=payload)
+        if res.status_code == 204:
+            print(f"通知成功: {time_str} - {place}")
+        else:
+            print(f"Discordへの通知に失敗しました: {res.status_code}")
 
-    # Discordへの通知メッセージ（埋め込み形式）
-    payload = {
-        "embeds": [
-            {
-                "title": f"🚨 地震情報（{quake.get('ttl', '震源・震度情報')}）",
-                "color": embed_color,
-                "fields": [
-                    {"name": "発生時刻", "value": time_str, "inline": True},
-                    {"name": "震源地", "value": place, "inline": True},
-                    {"name": "最大震度", "value": f"**震度 {max_int_display}**", "inline": False},
-                    {"name": "規模 (M)", "value": f"M{mag}", "inline": True},
-                ],
-                "footer": {"text": "情報元: 気象庁ホームページ"},
-                "url": "https://www.data.jma.go.jp/multi/quake/index.html?lang=jp"
-            }
-        ]
-    }
-
-    # Discordに送信
-    res = requests.post(WEBHOOK_URL, json=payload)
-    if res.status_code == 204:
-        print("Discordへの通知に成功しました。")
-        # 今回通知したIDを保存
+    # すべての送信が終わったら、一番最新の地震IDをファイルに記録
+    if new_latest_id:
         with open(STATUS_FILE, "w") as f:
-            f.write(quake_id)
-    else:
-        print(f"Discordへの通知に失敗しました: {res.status_code}")
+            f.write(new_latest_id)
 
 if __name__ == "__main__":
     main()
