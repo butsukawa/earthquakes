@@ -229,11 +229,21 @@ def main():
             ]
         }
 
-        res = requests.post(WEBHOOK_URL, json=payload)
-        if res.status_code == 204:
-            print(f"通知成功: {time_str_display} - {place}")
-        else:
-            print(f"Discordへの通知に失敗しました: {res.status_code}")
+        # カンマで区切られた複数のURLをリストに分解する
+        webhook_urls = [url.strip() for url in WEBHOOK_URL.split(",")]
+        
+        # それぞれのURLに対して順番に送信する
+        for url in webhook_urls:
+            if not url:
+                continue
+            try:
+                res = requests.post(url, json=payload)
+                if res.status_code == 204:
+                    print(f"通知成功: {time_str_display} - {place}")
+                else:
+                    print(f"Discordへの通知に失敗しました ({res.status_code})")
+            except Exception as e:
+                print(f"Webhook送信中にエラーが発生しました: {e}")
 
     if new_latest_id:
         with open(STATUS_FILE, "w") as f:
