@@ -39,10 +39,11 @@ def parse_coordinate(coord_str):
     depth_str = "不明"
     if len(matches) >= 3:
         depth_val = float(matches[2])
-        if depth_val <= 0:
+        # 気象庁のデータでは、プラス（+0 や +1000）の時が「ごく浅い（または海面上の空中）」となります
+        if depth_val >= 0:
             depth_str = "ごく浅い"
         else:
-            # メートルを1000で割ってkmにする（例: -10000 -> 10km）
+            # マイナスの値をプラスに反転させて（abs）、1000で割ってkmにする
             depth_str = f"{int(abs(depth_val) / 1000)}km"
             
     return latlon_str, depth_str
