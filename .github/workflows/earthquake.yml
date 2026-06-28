@@ -1,16 +1,16 @@
-name: Check Earthquake Information
+name: Earthquake Monitor Loop
 
 on:
   schedule:
-    # 5分ごとに自動チェックを実行
-    - cron: '*/5 * * * *'
-  workflow_dispatch: # GitHubの画面から手動で即時実行できるボタンを配置
+    # 6時間おきに起動 (UTC時間で 0:00, 6:00, 12:00, 18:00 -> 日本時間 9:00, 15:00, 21:00, 3:00)
+    # cronの起動自体はズレますが、起動した後はPython側が正確に5分間隔で5時間50分動き続けます。
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # 手動実行用ボタンも設置
 
 jobs:
-  check-and-notify:
+  monitor:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # last_earthquake.txt の変更をGitHubに書き戻すために必要
+    timeout-minutes: 360 # GitHubの最大実行時間である6時間(360分)に設定
 
     steps:
     - name: Checkout repository
@@ -26,15 +26,18 @@ jobs:
         python -m pip install --upgrade pip
         pip install requests
 
-    - name: Run bot
+    - name: Run Monitor Loop
       env:
         DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-      run: python earthquake_bot.py
+      run: |
+        python your_script_name.py # ★実際のPythonファイル名に書き換えてください
 
-    - name: Commit and Push changes
+    - name: Commit and Push Status File
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git add last_earthquake.txt
-        # 変更がある場合（新しい地震情報またはスキップ対象データがあり、IDが書き換わった場合）のみPush
-        git diff --cached --quiet || (git commit -m "Update last earthquake ID" && git push)
+        # 最後に通知した地震ID(last_earthquake.txt)に変更があればリポジトリに保存する
+        if [ -f last_earthquake.txt ]; then
+          git add last_earthquake.txt
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update last earthquake status [skip ci]" && git push)
+        fi
