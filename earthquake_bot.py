@@ -22,23 +22,37 @@ def get_earthquake_list():
 
 def parse_coordinate(coord_str):
     """
-    気象庁のCoordinate形式 (+35.8+138.3-10000/) を (35.8N, 138.3E) に変換する
+    気象庁のCoordinate形式 (+35.8+138.3-10000/) をパースし、
+    (緯度経度, 震源深度) のタプルで返す
     """
     if not coord_str:
-        return "不明"
-    # 正規表現で緯度と経度を抽出 (+/-数字.数字)
+        return "不明", "不明"
+    
     matches = re.findall(r'([+-]\d+(?:\.\d+)?)', coord_str)
-    if len(matches) >= 2:
-        lat = matches[0].replace('+', '')
-        lon = matches[1].replace('+', '')
-        return f"{lat}N, {lon}E"
-    return "不明"
+    if len(matches) < 2:
+        return "不明", "不明"
+        
+    lat = matches[0].replace('+', '')
+    lon = matches[1].replace('+', '')
+    latlon_str = f"{lat}N, {lon}E"
+    
+    depth_str = "不明"
+    if len(matches) >= 3:
+        depth_val = float(matches[2])
+        if depth_val <= 0:
+            depth_str = "ごく浅い"
+        else:
+            # メートルを1000で割ってkmにする（例: -10000 -> 10km）
+            depth_str = f"{int(abs(depth_val) / 1000)}km"
+            
+    return latlon_str, depth_str
 
 def get_earthquake_detail(json_filename):
     """
-    個別の詳細JSONから必要な詳細データを取得する
+    個別詳細JSONから必要な詳細データを取得する
     """
-    default_res = {"latlon": "不明", "headline": "", "forecast_comment": ""}
+    # depth を追加
+    default_res = {"latlon": "不明", "depth": "不明", "headline": "", "forecast_comment": ""}
     if not json_filename:
         return default_res
     try:
@@ -47,9 +61,9 @@ def get_earthquake_detail(json_filename):
         res.raise_for_status()
         data = res.json()
         
-        # 1. 緯度・経度の取得
+        # 1. 緯度・経度と深度の取得
         coord = data.get("Body", {}).get("Earthquake", {}).get("Hypocenter", {}).get("Area", {}).get("Coordinate", "")
-        latlon = parse_coordinate(coord)
+        latlon, depth = parse_coordinate(coord) # 2つの変数で受け取る
 
         # 2. ヘッドラインの取得
         headline = data.get("Head", {}).get("Headline", {}).get("Text", "")
@@ -59,6 +73,7 @@ def get_earthquake_detail(json_filename):
 
         return {
             "latlon": latlon,
+            "depth": depth, # 辞書に追加
             "headline": headline,
             "forecast_comment": forecast_comment
         }
@@ -190,12 +205,13 @@ def main():
         max_int_display = int_display_map.get(max_int, max_int)
         embed_color = get_embed_color(max_int)
 
-        # ご要望通りのメッセージ本文を組み立て
+        # ご要望通りのメッセージ本文を組み立て（震源深度を追加）
         description_text = (
             f"**・地震概要**\n"
             f"震源地域: {place}（{detail['latlon']}）\n"
+            f"震源深度: {detail['depth']}\n"
             f"発生日時: {time_str_display}\n"
-            f"最大震度: {max_int_display}（地震の規模: M{mag}）\n\n"
+            f"最大震度: 震度 {max_int_display}（地震の規模: M{mag}）\n\n"
             f"**・コメント**\n"
             f"{comment_display}"
         )
