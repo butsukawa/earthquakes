@@ -1,0 +1,40 @@
+name: Check Earthquake Information
+
+on:
+  schedule:
+    # 5分ごとに自動チェックを実行
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # GitHubの画面から手動で即時実行できるボタンを配置
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # last_earthquake.txt の変更をGitHubに書き戻すために必要
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
+
+    - name: Run bot
+      env:
+        DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      run: python earthquake_bot.py
+
+    - name: Commit and Push changes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add last_earthquake.txt
+        # 変更がある場合（新しい地震情報またはスキップ対象データがあり、IDが書き換わった場合）のみPush
+        git diff --cached --quiet || (git commit -m "Update last earthquake ID" && git push)
