@@ -30,7 +30,7 @@ jobs:
       env:
         DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       run: |
-        python your_script_name.py # ★実際のPythonファイル名に書き換えてください
+        python earthquake_bot.py # ★実際のPythonファイル名に書き換えてください
 
     - name: Commit and Push Status File
       run: |
