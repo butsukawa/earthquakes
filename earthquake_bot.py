@@ -1,6 +1,7 @@
 import os
 import requests
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 # Discord Webhook URL (GitHub ActionsのSecretsから読み込む)
@@ -8,23 +9,69 @@ WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 STATUS_FILE = "last_earthquake.txt"
 
 # 気象庁の地震情報JSON (最新の地震リスト)
-JMA_URL = "https://www.jma.go.jp/bosai/quake/data/list.json"
+JMA_LIST_URL = "https://www.jma.go.jp/bosai/quake/data/list.json"
 
 def get_earthquake_list():
     try:
-        response = requests.get(JMA_URL)
+        response = requests.get(JMA_LIST_URL)
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        print(f"データの取得に失敗しました: {e}")
+        print(f"リストの取得に失敗しました: {e}")
     return []
+
+def parse_coordinate(coord_str):
+    """
+    気象庁のCoordinate形式 (+35.8+138.3-10000/) を (35.8N, 138.3E) に変換する
+    """
+    if not coord_str:
+        return "不明"
+    # 正規表現で緯度と経度を抽出 (+/-数字.数字)
+    matches = re.findall(r'([+-]\d+(?:\.\d+)?)', coord_str)
+    if len(matches) >= 2:
+        lat = matches[0].replace('+', '')
+        lon = matches[1].replace('+', '')
+        return f"{lat}N, {lon}E"
+    return "不明"
+
+def get_earthquake_detail(json_filename):
+    """
+    個別の詳細JSONから必要な詳細データを取得する
+    """
+    default_res = {"latlon": "不明", "headline": "", "forecast_comment": ""}
+    if not json_filename:
+        return default_res
+    try:
+        detail_url = f"https://www.jma.go.jp/bosai/quake/data/{json_filename}"
+        res = requests.get(detail_url)
+        res.raise_for_status()
+        data = res.json()
+        
+        # 1. 緯度・経度の取得
+        coord = data.get("Body", {}).get("Earthquake", {}).get("Hypocenter", {}).get("Area", {}).get("Coordinate", "")
+        latlon = parse_coordinate(coord)
+
+        # 2. ヘッドラインの取得
+        headline = data.get("Head", {}).get("Headline", {}).get("Text", "")
+
+        # 3. 津波コメントの取得
+        forecast_comment = data.get("Body", {}).get("Comments", {}).get("ForecastComment", {}).get("Text", "")
+
+        return {
+            "latlon": latlon,
+            "headline": headline,
+            "forecast_comment": forecast_comment
+        }
+    except Exception as e:
+        print(f"詳細JSONの取得エラー ({json_filename}): {e}")
+    return default_res
 
 def get_embed_color(max_int):
     """
     震度に応じたDiscord Embedの10進数カラーコードを返す
     """
     color_map = {
-        "1": 16777215,  # 白色 (#FFFFFF)
+        "1": 8421504,   # 灰色 (#808080)
         "2": 5294297,   # 水色 (#50C8EF)
         "3": 3381621,   # 青緑色 (#339975)
         "4": 3066993,   # 緑色 (#2ECC71)
@@ -46,99 +93,131 @@ def main():
         print("地震データが空、または取得できませんでした。")
         return
 
-    # 過去の最新ID（前回通知済みの一番新しい地震）を読み込み
+    # 過去の最新IDを読み込み
     last_id = ""
     if os.path.exists(STATUS_FILE):
         with open(STATUS_FILE, "r") as f:
             last_id = f.read().strip()
 
-    # 現在時刻から24時間前の基準時刻を計算 (JSTベース)
-    # 気象庁の at は ISO8601形式 (例: 2026-06-28T09:12:00+09:00)
+    # 現在時刻から24時間前の基準時刻 (JSTベース)
     now_jst = datetime.now(timezone(timedelta(hours=9)))
     one_day_ago = now_jst - timedelta(days=1)
 
-    # 通知対象の地震をフィルタリングする
     targets = []
     new_latest_id = None
+    
+    # 重複防止用セット
+    processed_eids = set()
+    processed_times = set()
 
     for i, quake in enumerate(quakes):
         quake_id = quake.get("eid", quake.get("at", ""))
         
-        # 配列の先頭（インデックス0）が気象庁データの一番最新のID
         if i == 0:
             new_latest_id = quake_id
 
-        # 前回通知したIDに到達したら、それより古い（過去の）データは処理しない
         if last_id and quake_id == last_id:
             break
 
-        # 震度情報がないデータ（「顕著な地震要素更新」など）はスキップ
         max_int = quake.get("maxi", "").strip()
         if max_int == "" or max_int == "-":
             continue
 
-        # 時刻のチェック（過去24時間以内か）
         at_str = quake.get("at", "")
+        
+        # 重複・古い速報データのスキップ
+        if quake_id in processed_eids or at_str in processed_times:
+            continue
+        
         try:
-            # ISO形式からdatetimeオブジェクトに変換
             dt = datetime.fromisoformat(at_str)
             if dt < one_day_ago:
-                # 24時間より古いデータに達したらループ終了（JMAデータは新しい順に並んでいるため）
                 break
         except Exception as e:
             print(f"時刻パースエラー: {e}")
             continue
 
-        # 条件をクリアした地震を通知候補に追加
+        if quake.get("eid"):
+            processed_eids.add(quake.get("eid"))
+        processed_times.add(at_str)
+
         targets.append((quake_id, quake, dt, max_int))
 
     if not targets:
-        print("通知対象の新しい地震（過去24時間以内）はありません。")
-        # ログファイルが空だった場合などのために最新IDだけ保存して終了
+        print("通知対象の新しい地震はありません。")
         if new_latest_id and new_latest_id != last_id:
             with open(STATUS_FILE, "w") as f:
                 f.write(new_latest_id)
         return
 
-    # 気象庁データは「新しい順」に入っているので、過去を遡る時は「古い順」に並び替えて通知する
+    # 古い順（発生した順）にソート
     targets.reverse()
 
-    print(f"{len(targets)} 件の地震情報をDiscordに送信します。")
+    print(f"{len(targets)} 件の地震情報を送信します。")
 
     for quake_id, quake, dt, max_int in targets:
-        time_str = dt.strftime("%Y/%m/%d %H:%M")
-        place = quake.get("anm", "調査中")
+        place = quake.get("anm", "---")
         mag = quake.get("mag", "不明")
+        ctt = quake.get("ctt", "")
+        json_file = quake.get("json", "")
+        ttl = quake.get("ttl", "震源・震度情報")
+
+        # 1. 個別詳細JSONから詳細項目（緯度経度・ヘッドライン・津波）を取得
+        detail = get_earthquake_detail(json_file)
         
+        # 震度速報時などで震源が取得できない場合のケア
+        if (place == "" or place == "---") and "速報" in ttl:
+            place = "（震源地は調査中）"
+
+        # 2. 発生日時のフォーマット（秒を除外して「頃」を付与）
+        time_str_display = f"{dt.strftime('%Y-%m-%d %H:%M')} 頃"
+
+        # 3. コメント欄の構築（ヘッドライン文 ＋ 津波情報をマージ）
+        comment_parts = []
+        if detail["headline"]:
+            comment_parts.append(detail["headline"])
+        if detail["forecast_comment"]:
+            comment_parts.append(detail["forecast_comment"])
+        comment_display = "\n".join(comment_parts) if comment_parts else "なし"
+
+        # 4. タイトル用URL (cttを利用)
+        detail_url = f"https://www.data.jma.go.jp/multi/quake/quake_detail.html?eventID={ctt}&lang=jp" if ctt else "https://www.data.jma.go.jp/multi/quake/index.html?lang=jp"
+
+        # タイトルの日付作成用の年月日
+        title_date_str = dt.strftime('%Y年%m月%d日')
+
         int_display_map = {"5-": "5弱", "5+": "5強", "6-": "6弱", "6+": "6強"}
         max_int_display = int_display_map.get(max_int, max_int)
         embed_color = get_embed_color(max_int)
 
+        # ご要望通りのメッセージ本文を組み立て
+        description_text = (
+            f"**・地震概要**\n"
+            f"震源地域: {place}（{detail['latlon']}）\n"
+            f"発生日時: {time_str_display}\n"
+            f"最大震度: {max_int_display}（地震の規模: M{mag}）\n\n"
+            f"**・コメント**\n"
+            f"{comment_display}"
+        )
+
         payload = {
             "embeds": [
                 {
-                    "title": f"🚨 地震情報（{quake.get('ttl', '震源・震度情報')}）",
+                    "title": f"【地震速報】{title_date_str}",
+                    "url": detail_url,
                     "color": embed_color,
-                    "fields": [
-                        {"name": "発生時刻", "value": time_str, "inline": True},
-                        {"name": "震源地", "value": place, "inline": True},
-                        {"name": "最大震度", "value": f"**震度 {max_int_display}**", "inline": False},
-                        {"name": "規模 (M)", "value": f"M{mag}", "inline": True},
-                    ],
-                    "footer": {"text": "情報元: 気象庁ホームページ"},
-                    "url": "https://www.data.jma.go.jp/multi/quake/index.html?lang=jp"
+                    "description": description_text,
+                    "footer": {"text": "情報提供: 気象庁"}
                 }
             ]
         }
 
-        # Discordに送信
         res = requests.post(WEBHOOK_URL, json=payload)
         if res.status_code == 204:
-            print(f"通知成功: {time_str} - {place}")
+            print(f"通知成功: {time_str_display} - {place}")
         else:
             print(f"Discordへの通知に失敗しました: {res.status_code}")
 
-    # すべての送信が終わったら、一番最新の地震IDをファイルに記録
     if new_latest_id:
         with open(STATUS_FILE, "w") as f:
             f.write(new_latest_id)
