@@ -220,7 +220,7 @@ def main():
         payload = {
             "embeds": [
                 {
-                    "title": f"【地震速報】{title_date_str}",
+                    "title": f"【地震速報】地震が発生しました。",
                     "url": detail_url,
                     "color": embed_color,
                     "description": description_text,
