@@ -2,6 +2,7 @@ import os
 import requests
 import json
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 # Discord Webhook URL (GitHub ActionsのSecretsから読み込む)
@@ -20,40 +21,52 @@ def get_earthquake_list():
         print(f"リストの取得に失敗しました: {e}")
     return []
 
+# --- 追加・変更箇所（関数を新規追加 / parse_coordinateも少し修正） ---
+
 def parse_coordinate(coord_str):
     """
     気象庁のCoordinate形式 (+35.8+138.3-10000/) をパースし、
-    (緯度経度, 震源深度) のタプルで返す
+    (緯度経度文字列, 緯度数値, 経度数値, 震源深度) のタプルで返す
     """
     if not coord_str:
-        return "不明", "不明"
+        return "不明", None, None, "不明"
     
     matches = re.findall(r'([+-]\d+(?:\.\d+)?)', coord_str)
     if len(matches) < 2:
-        return "不明", "不明"
+        return "不明", None, None, "不明"
         
-    lat = matches[0].replace('+', '')
-    lon = matches[1].replace('+', '')
-    latlon_str = f"{lat}N, {lon}E"
+    lat_val = float(matches[0])
+    lon_val = float(matches[1])
+    latlon_str = f"{lat_val}N, {lon_val}E"
     
     depth_str = "不明"
     if len(matches) >= 3:
         depth_val = float(matches[2])
-        # 気象庁のデータでは、プラス（+0 や +1000）の時が「ごく浅い（または海面上の空中）」となります
         if depth_val >= 0:
             depth_str = "ごく浅い"
         else:
-            # マイナスの値をプラスに反転させて（abs）、1000で割ってkmにする
             depth_str = f"{int(abs(depth_val) / 1000)}km"
             
-    return latlon_str, depth_str
+    return latlon_str, lat_val, lon_val, depth_str
+
+
+def get_gsi_maps_url(lat, lon):
+    """
+    緯度・経度を小数点第6位に四捨五入/0埋めし、国土地理院地図のURLを生成する
+    """
+    if lat is None or lon is None:
+        return None
+    # 小数点第6位で四捨五入（formatでf指定すると自動で四捨五入・0埋めされます）
+    lat_formatted = f"{lat:.6f}"
+    lon_formatted = f"{lon:.6f}"
+    return f"https://maps.gsi.go.jp/#9/{lat_formatted}/{lon_formatted}/"
 
 def get_earthquake_detail(json_filename):
     """
     個別詳細JSONから必要な詳細データを取得する
     """
-    # depth を追加
-    default_res = {"latlon": "不明", "depth": "不明", "headline": "", "forecast_comment": ""}
+    # 変更点：デフォルト値に "gsi_url" を追加
+    default_res = {"latlon": "不明", "depth": "不明", "gsi_url": None, "headline": "", "forecast_comment": ""}
     if not json_filename:
         return default_res
     try:
@@ -64,17 +77,24 @@ def get_earthquake_detail(json_filename):
         
         # 1. 緯度・経度と深度の取得
         coord = data.get("Body", {}).get("Earthquake", {}).get("Hypocenter", {}).get("Area", {}).get("Coordinate", "")
-        latlon, depth = parse_coordinate(coord) # 2つの変数で受け取る
+        
+        # 変更点：新しく定義した parse_coordinate から、緯度(lat_val)・経度(lon_val)の数値も一緒に受け取る
+        latlon, lat_val, lon_val, depth = parse_coordinate(coord) 
 
-        # 2. ヘッドラインの取得
+        # 変更点：取得した数値を使って国土地理院地図のURLを生成する
+        gsi_url = get_gsi_maps_url(lat_val, lon_val)
+
+        # 2. ヘッドラインの取得 (元のロジックのまま)
         headline = data.get("Head", {}).get("Headline", {}).get("Text", "")
 
-        # 3. 津波コメントの取得
+        # 3. 津波コメントの取得 (元のロジックのまま)
         forecast_comment = data.get("Body", {}).get("Comments", {}).get("ForecastComment", {}).get("Text", "")
 
+        # 変更点：戻り値の辞書に "gsi_url" を追加して返す
         return {
             "latlon": latlon,
-            "depth": depth, # 辞書に追加
+            "depth": depth,
+            "gsi_url": gsi_url, # ここに追加
             "headline": headline,
             "forecast_comment": forecast_comment
         }
@@ -249,5 +269,24 @@ def main():
         with open(STATUS_FILE, "w") as f:
             f.write(new_latest_id)
 
+# --- 変更箇所（スクリプトの一番下、実行部分） ---
 if __name__ == "__main__":
-    main()
+    # 5時間50分 = 350分 = 21,000秒
+    RUN_DURATION = 21000  
+    INTERVAL = 300 # 5分
+    
+    start_time = time.time()
+    print("地震監視スクリプトを開始しました（5時間50分稼働します）")
+    
+    while True:
+        # メイン処理の実行
+        main()
+        
+        # 経過時間のチェック
+        elapsed_time = time.time() - start_time
+        if elapsed_time + INTERVAL > RUN_DURATION:
+            print("5時間50分が経過するため、監視を終了します。")
+            break
+            
+        print(f"次の確認まで {INTERVAL} 秒待機します... (残り時間: {int((RUN_DURATION - elapsed_time)/60)} 分)")
+        time.sleep(INTERVAL)
